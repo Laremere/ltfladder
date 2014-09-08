@@ -8,11 +8,12 @@ import (
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/yohcop/openid.go/src/openid"
+	"io"
 	"log"
 	"net/http"
 )
 
-var root = "http://vps.redig.us"
+var root = "https://vps.redig.us"
 
 var staticDir = "/static/"
 var staticRoot = root + staticDir
@@ -50,14 +51,20 @@ func AuthenticateHandler(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	var authtoken string
-	{
+	{ //Use crypto rand to generate base32 token
 		var buffer bytes.Buffer
-
+		encoder := base32.NewEncoder(base32.StdEncoding, &buffer)
+		_, err = io.CopyN(encoder, rand.Reader, 20)
 		if err != nil {
-			http.Error(rw, "Error generating auth token"+err.Error(), http.StatusInternalServerError)
+			http.Error(rw, "Error generating auth token", http.StatusInternalServerError)
 			return
 		}
-		authtoken = string(bytes)
+		err = encoder.Close()
+		if err != nil {
+			http.Error(rw, "Error generating auth token", http.StatusInternalServerError)
+			return
+		}
+		authtoken = string(buffer.Bytes())
 	}
 
 	fmt.Fprintln(rw, id)
@@ -103,7 +110,14 @@ func main() {
 	http.Handle(staticDir,
 		http.StripPrefix(staticDir, http.FileServer(http.Dir("./static/"))))
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	go func() {
+		log.Fatal(http.ListenAndServe(":8080", http.HandlerFunc(
+			func(w http.ResponseWriter, req *http.Request) {
+				http.Redirect(w, req, root+req.RequestURI, http.StatusMovedPermanently)
+			})))
+	}()
+	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", nil))
+
 }
 
 type userID int64
