@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base32"
+	"encoding/json"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/yohcop/openid.go/src/openid"
@@ -27,27 +28,67 @@ var nonceStore = &openid.SimpleNonceStore{
 	Store: make(map[string][]*openid.Nonce)}
 var discoveryCache = &openid.SimpleDiscoveryCache{}
 
-func IndexHandler(rw http.ResponseWriter, req *http.Request) {
-	fmt.Fprintln(rw, "Hello, "+req.URL.Path)
+func IndexHandler(w http.ResponseWriter, req *http.Request) {
+	fmt.Fprintln(w, "<a href='"+root+"/login'>login</a>"+req.URL.Path)
 }
 
-func LoginHandler(rw http.ResponseWriter, req *http.Request) {
+func LoginHandler(w http.ResponseWriter, req *http.Request) {
 	url, err := openid.RedirectUrl("http://steamcommunity.com/openid",
 		root+"/openidcallback", root)
 	if err != nil {
-		http.Error(rw, "Error with openID redirect", http.StatusInternalServerError)
+		http.Error(w, "Error with openID redirect", http.StatusInternalServerError)
+		log.Println("Error with openID redirect", err)
 		return
 	}
-	http.Redirect(rw, req, url, 303)
+	http.Redirect(w, req, url, 303)
 }
 
-func AuthenticateHandler(rw http.ResponseWriter, req *http.Request) {
-	id, err := openid.Verify(
+type SteamApiPlayer struct {
+	Username string `json:"personaname"`
+}
+
+type SteamApiResponse struct {
+	Response SteamApiPlayers `json:"response"`
+}
+
+type SteamApiPlayers struct {
+	Players []SteamApiPlayer `json:"players"`
+}
+
+func AuthenticateHandler(w http.ResponseWriter, req *http.Request) {
+	//Verify openID
+	steamId, err := openid.Verify(
 		root+req.URL.String(),
 		discoveryCache, nonceStore)
 	if err != nil {
-		http.Error(rw, "Error with openID authentication", http.StatusInternalServerError)
+		http.Error(w, "Login error", http.StatusInternalServerError)
+		log.Println("Error with openID authentication", err)
 		return
+	}
+	{
+		const idPrefix = "http://steamcommunity.com/openid/id/"
+		if steamId[0:len(idPrefix)] != idPrefix {
+			http.Error(w, "Login error", http.StatusInternalServerError)
+			log.Println("Not a steam openid", steamId)
+			return
+		}
+		steamId = steamId[len(idPrefix):]
+	}
+
+	var user int64
+	{
+		err = db.QueryRow("SELECT uid FROM users WHERE steamid=?", steamId).Scan(&user)
+		if err == sql.ErrNoRows {
+			user = CreateUser(steamId)
+			if user == 0 {
+				http.Error(w, "Login error", http.StatusInternalServerError)
+				return
+			}
+		} else if err != nil {
+			http.Error(w, "Login error", http.StatusInternalServerError)
+			log.Println("Database error", err)
+			return
+		}
 	}
 
 	var authtoken string
@@ -56,19 +97,59 @@ func AuthenticateHandler(rw http.ResponseWriter, req *http.Request) {
 		encoder := base32.NewEncoder(base32.StdEncoding, &buffer)
 		_, err = io.CopyN(encoder, rand.Reader, 20)
 		if err != nil {
-			http.Error(rw, "Error generating auth token", http.StatusInternalServerError)
+			http.Error(w, "Login error", http.StatusInternalServerError)
+			log.Println("Error generating auth token", err)
 			return
 		}
 		err = encoder.Close()
 		if err != nil {
-			http.Error(rw, "Error generating auth token", http.StatusInternalServerError)
+			http.Error(w, "Login error", http.StatusInternalServerError)
+			log.Println("Error generating auth token", err)
 			return
 		}
 		authtoken = string(buffer.Bytes())
 	}
 
-	fmt.Fprintln(rw, id)
-	fmt.Fprintln(rw, authtoken)
+	fmt.Fprintln(w, steamId)
+	fmt.Fprintln(w, authtoken)
+	fmt.Fprintln(w, user)
+}
+
+func CreateUser(steamId string) (user int64) {
+	var userName string
+	{
+		var apiResp SteamApiResponse
+		resp, err := http.Get("http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=5FF09180C866D99FDAD4AB5401AF668F&steamids=" + steamId)
+		if err != nil {
+			log.Println("Unable to get steam name", err)
+			return
+		}
+		decoder := json.NewDecoder(resp.Body)
+		err = decoder.Decode(&apiResp)
+		if err != nil {
+			log.Println("Unable to get steam name", err)
+			return
+		}
+		userName = apiResp.Response.Players[0].Username
+		if userName == "" {
+			log.Println("Unable to get steam name", err)
+			return
+		}
+	}
+
+	_, err := db.Exec("INSERT INTO users (steamid, steamname) VALUES (?,?)", steamId, userName)
+	if err != nil {
+		log.Println("Unable to create account", err)
+		return
+	}
+
+	err = db.QueryRow("SELECT uid FROM users WHERE steamid=?", steamId).Scan(&user)
+	if err != nil {
+		log.Println("Database error", err)
+		return 0
+	}
+
+	return
 }
 
 // func logUsers(db *sql.DB) {
