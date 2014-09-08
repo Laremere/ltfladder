@@ -12,9 +12,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
+	"time"
 )
 
 var root = "https://vps.redig.us"
+var rawroot = "vps.redig.us" //no https
 
 var staticDir = "/static/"
 var staticRoot = root + staticDir
@@ -29,7 +32,17 @@ var nonceStore = &openid.SimpleNonceStore{
 var discoveryCache = &openid.SimpleDiscoveryCache{}
 
 func IndexHandler(w http.ResponseWriter, req *http.Request) {
-	fmt.Fprintln(w, "<a href='"+root+"/login'>login</a>"+req.URL.Path)
+	user, err := authenticate(req)
+	if err != nil {
+		http.Error(w, "Login error", http.StatusInternalServerError)
+		log.Println("authenticate error", err)
+		return
+	}
+	if user == nil {
+		fmt.Fprintln(w, "<a href='"+root+"/login'>login</a>"+req.URL.Path)
+	} else {
+		fmt.Fprintln(w, "Hello,", user.Name)
+	}
 }
 
 func LoginHandler(w http.ResponseWriter, req *http.Request) {
@@ -110,9 +123,29 @@ func AuthenticateHandler(w http.ResponseWriter, req *http.Request) {
 		authtoken = string(buffer.Bytes())
 	}
 
-	fmt.Fprintln(w, steamId)
-	fmt.Fprintln(w, authtoken)
-	fmt.Fprintln(w, user)
+	//Set authtoken in database
+	_, err = db.Exec("UPDATE users SET authtoken=? WHERE uid=?", authtoken, user)
+	if err != nil {
+		http.Error(w, "Login error", http.StatusInternalServerError)
+		log.Println("Database error", err)
+		return
+	}
+
+	authtoken = strconv.FormatInt(user, 10) + "_" + authtoken
+
+	//Set client's authtoken
+	{
+		expire := time.Now().AddDate(0, 0, 7) //Expire in 1 week
+		cookie := http.Cookie{
+			"authtoken", authtoken, "", rawroot, expire,
+			expire.Format(time.UnixDate), 60 * 60 * 24 * 7, true, true,
+			"authtoken=" + authtoken, []string{"authtoken=" + authtoken},
+		}
+		http.SetCookie(w, &cookie)
+
+	}
+
+	http.Redirect(w, req, root, 303)
 }
 
 func CreateUser(steamId string) (user int64) {
@@ -191,6 +224,7 @@ func main() {
 	http.Handle(staticDir,
 		http.StripPrefix(staticDir, http.FileServer(http.Dir("./static/"))))
 
+	//Redirect http to https and serve https requests
 	go func() {
 		log.Fatal(http.ListenAndServe(":8080", http.HandlerFunc(
 			func(w http.ResponseWriter, req *http.Request) {
@@ -201,12 +235,43 @@ func main() {
 
 }
 
-type userID int64
-
-func (id *userID) Valid() bool {
-	return *id > 0
+type User struct {
+	Uid  int64
+	Name string
 }
 
-func authenticate(req *http.Request) (userID, error) {
-	return 0, nil
+func authenticate(req *http.Request) (*User, error) {
+	authCookie, err := req.Cookie("authtoken")
+	if err == http.ErrNoCookie {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	authToken := authCookie.Value
+	underscorePos := 0
+	for ; underscorePos < len(authToken); underscorePos++ {
+		if authToken[underscorePos] == '_' {
+			break
+		}
+	}
+
+	var user User
+	user.Uid, err = strconv.ParseInt(authToken[0:underscorePos], 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	authToken = authToken[underscorePos+1:]
+	var correctToken string
+	err = db.QueryRow("SELECT authtoken, steamname FROM users WHERE uid=?", user.Uid).Scan(&correctToken, &user.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	if authToken != correctToken {
+		return nil, nil
+	}
+
+	return &user, nil
 }
