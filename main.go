@@ -45,6 +45,52 @@ func IndexHandler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func UserHandler(w http.ResponseWriter, req *http.Request) {
+	var userid int64
+	if req.URL.Path == "/user/" {
+		user, err := authenticate(req)
+		if err != nil {
+			http.Error(w, "User page error", http.StatusBadRequest)
+			return
+		}
+		if user != nil {
+			userid = user.Uid
+		}
+	} else {
+		_, err := fmt.Sscanf(req.URL.Path, "/user/%d/", &userid)
+		if err != nil {
+			http.Error(w, "User page error", http.StatusBadRequest)
+			log.Println("User page error, ", err)
+			return
+		}
+	}
+
+	var steamname string
+	var stars string
+
+	err := db.QueryRow("SELECT steamname, stars FROM users WHERE uid=?", userid).Scan(&steamname, &stars)
+	if err == sql.ErrNoRows {
+		http.Error(w, "No such user", http.StatusInternalServerError)
+		return
+	} else if err != nil {
+		http.Error(w, "User page error", http.StatusInternalServerError)
+		log.Println("Database error", err)
+		return
+	}
+
+	attribs := make(map[string]interface{})
+	attribs["userid"] = userid
+	attribs["steamname"] = steamname
+	attribs["stars"] = stars
+
+	err = json.NewEncoder(w).Encode(attribs)
+	if err != nil {
+		http.Error(w, "User page error", http.StatusBadRequest)
+		log.Println("User page error, ", err)
+		return
+	}
+}
+
 func LoginHandler(w http.ResponseWriter, req *http.Request) {
 	url, err := openid.RedirectUrl("http://steamcommunity.com/openid",
 		root+"/openidcallback", root)
@@ -185,24 +231,6 @@ func CreateUser(steamId string) (user int64) {
 	return
 }
 
-// func logUsers(db *sql.DB) {
-// 	rows, err := db.Query("Select steamname from users")
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-// 	defer rows.Close()
-// 	for rows.Next() {
-// 		var name string
-// 		if err := rows.Scan(&name); err != nil {
-// 			log.Fatal(err)
-// 		}
-// 		log.Println(name)
-// 	}
-// 	if err := rows.Err(); err != nil {
-// 		log.Fatal(err)
-// 	}
-// }
-
 var db, dbErr = sql.Open("mysql", "root:root@/ltfladder")
 
 func main() {
@@ -221,8 +249,11 @@ func main() {
 	http.HandleFunc("/", IndexHandler)
 	http.HandleFunc("/login", LoginHandler)
 	http.HandleFunc("/openidcallback", AuthenticateHandler)
+	http.HandleFunc("/user/", UserHandler)
 	http.Handle(staticDir,
 		http.StripPrefix(staticDir, http.FileServer(http.Dir("./static/"))))
+
+	go MatchMaking()
 
 	//Redirect http to https and serve https requests
 	go func() {
@@ -274,4 +305,32 @@ func authenticate(req *http.Request) (*User, error) {
 	}
 
 	return &user, nil
+}
+
+type MatchMakingChallenge struct {
+	Challenger, Victum int64
+}
+
+var ListMatchMakingChan = make(chan chan []*User)
+var EnterMatchMaking = make(chan *User)
+var ExitMatchMaking = make(chan *User)
+var PostMatchMakingChallenge = make(chan MatchMakingChallenge)
+
+func MatchMaking() {
+	currentChallengers := make([]*User, 0)
+	for {
+		select {
+		case request := <-ListMatchMakingChan:
+			requestResult := make([]*User, len(currentChallengers))
+			copy(requestResult, currentChallengers)
+			request <- requestResult
+
+		case user := <-EnterMatchMaking:
+			_ = user
+		case user := <-ExitMatchMaking:
+			_ = user
+		case challenge := <-PostMatchMakingChallenge:
+			_ = challenge
+		}
+	}
 }
